@@ -313,6 +313,17 @@ local function run_query(job, query, target, file_type)
 	return output
 end
 
+local function dbg_output(prefix, output)
+	if not output then
+		ya.dbg(string.format("%s stdout: [nil]", prefix))
+		ya.dbg(string.format("%s stderr: [nil]", prefix))
+		return
+	end
+
+	ya.dbg(string.format("%s stdout: %s", prefix, tostring(output.stdout)))
+	ya.dbg(string.format("%s stderr: %s", prefix, tostring(output.stderr)))
+end
+
 local function generate_db_query(limit, offset)
 	local scroll = get_opts("scrolled_columns") or 0
 
@@ -573,21 +584,30 @@ local function render_output(output, job)
 	})
 end
 
+local function has_content(s)
+	return s ~= nil and s:match("%S") ~= nil
+end
+
 local function output_is_valid(output, mode, job)
-	if output then
-		if output.stderr and output.stderr ~= "" then
-			ya.err("DuckDB returned an error or:\n" .. output.stderr)
-			return false
-		elseif not output.stdout or output.stdout == "" then
-			ya.err(string.format("Peek - No stdout/stderr from %s cache for %s", mode, job.file.url))
-			return false
-		else
-			return true
-		end
-	else
-		ya.err("Duckdb failed to return output")
+	if not output then
+		ya.err("DuckDB failed to return output")
 		return false
 	end
+
+	if has_content(output.stdout) then
+		if has_content(output.stderr) then
+			ya.dbg("DuckDB stderr (ignored because stdout exists): " .. output.stderr)
+		end
+		return true
+	end
+
+	if has_content(output.stderr) then
+		ya.err("DuckDB returned stderr without usable stdout:\n" .. output.stderr)
+	else
+		ya.err(string.format("Peek - No stdout/stderr from %s cache for %s", mode, job.file.url))
+	end
+
+	return false
 end
 
 local function prepare_peek_context(job)
@@ -668,35 +688,32 @@ local function create_cache(job, mode, file_type, limit)
 	add_to_list("preloading", cache_str)
 
 	local target = tostring(cache_url)
-
 	local base_query = generate_preload_query(job, mode, file_type, limit)
 	local query = string.format("COPY (%s) TO '%s' (FORMAT 'parquet');", base_query, target)
-	local output = run_query(job, query, nil, file_type)
-	ya.dbg("stdout: " .. tostring(output.stdout))
-	ya.dbg("stderr: " .. tostring(output.stderr))
 
-	if not output or (output.stderr and output.stderr ~= "") then
+	local output = run_query(job, query, nil, file_type)
+	dbg_output(string.format("[duckdb preload:%s]", mode), output)
+
+	if not output then
 		ya.err(
-			output
-					and string.format(
-						"[duckdb] error creating %s cache for %s: %s",
-						mode,
-						tostring(job.file.url),
-						output.stderr
-					)
-				or string.format(
-					"[duckdb] no output returned while creating %s cache for %s",
-					mode,
-					tostring(job.file.url)
-				)
+			string.format("[duckdb] no output returned while creating %s cache for %s", mode, tostring(job.file.url))
 		)
 		remove_file(cache_url)
-		local result = finish_preload(false, cache_str)
-		return result
+		return finish_preload(false, cache_str)
 	end
 
-	local result = finish_preload(true, cache_str)
-	return result
+	if output.stderr and output.stderr ~= "" then
+		ya.dbg(
+			string.format(
+				"[duckdb] non-fatal stderr while creating %s cache for %s: %s",
+				mode,
+				tostring(job.file.url),
+				output.stderr
+			)
+		)
+	end
+
+	return finish_preload(true, cache_str)
 end
 
 local function is_plain_text(job, file_type)
@@ -758,8 +775,7 @@ function M:peek(job)
 	local query = generate_peek_query(args.target, job, args.limit, args.offset, args.file_type, args.cache_str)
 	ya.dbg("query: " .. tostring(query))
 	local output = run_query(job, query, args.target, args.file_type)
-	ya.dbg("stdout: " .. tostring(output.stdout))
-	ya.dbg("stderr: " .. tostring(output.stderr))
+	dbg_output("[duckdb peek]", output)
 	if not output_is_valid(output, args.mode, job) then
 		if args.target == args.cache_url and args.scrolled_collumns == 0 then
 			add_to_list("bad_cache", args.cache_str)
